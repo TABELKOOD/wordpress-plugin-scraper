@@ -15,13 +15,14 @@ const (
 	minInstalls  = 1000
 	maxWorkers   = 5
 	requestRetry = 3
+	rateLimit    = time.Second / 2 // 2 requests per second
 )
 
 type Plugin struct {
-	Slug          string `json:"slug"`
-	Version       string `json:"version"`
-	DownloadLink  string `json:"download_link"`
-	ActiveInstalls int   `json:"active_installs"`
+	Slug           string `json:"slug"`
+	Version        string `json:"version"`
+	DownloadLink   string `json:"download_link"`
+	ActiveInstalls int    `json:"active_installs"`
 }
 
 type PluginList struct {
@@ -30,20 +31,21 @@ type PluginList struct {
 
 func fetchPluginList(pageNumber int) (PluginList, error) {
 	var pluginList PluginList
-
 	url := fmt.Sprintf(baseURL, pageNumber)
-	resp, err := http.Get(url)
-	if err != nil {
-		return pluginList, err
-	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return pluginList, fmt.Errorf("status code error: %d %s", resp.StatusCode, resp.Status)
+	for i := 0; i < requestRetry; i++ {
+		resp, err := http.Get(url)
+		if err == nil && resp.StatusCode == http.StatusOK {
+			defer resp.Body.Close()
+			err = json.NewDecoder(resp.Body).Decode(&pluginList)
+			if err == nil {
+				return pluginList, nil
+			}
+		}
+		time.Sleep(rateLimit)
 	}
 
-	err = json.NewDecoder(resp.Body).Decode(&pluginList)
-	return pluginList, err
+	return pluginList, fmt.Errorf("failed to fetch page %d after %d retries", pageNumber, requestRetry)
 }
 
 func downloadPlugin(plugin Plugin, wg *sync.WaitGroup) {
@@ -51,7 +53,7 @@ func downloadPlugin(plugin Plugin, wg *sync.WaitGroup) {
 
 	resp, err := http.Get(plugin.DownloadLink)
 	if err != nil {
-		fmt.Printf("Failed to download %s: %v\n", plugin.Slug, err)
+		fmt.Printf("Failed to download %s (%s): %v\n", plugin.Slug, plugin.DownloadLink, err)
 		return
 	}
 	defer resp.Body.Close()
@@ -66,18 +68,18 @@ func downloadPlugin(plugin Plugin, wg *sync.WaitGroup) {
 
 	_, err = io.Copy(file, resp.Body)
 	if err != nil {
-		fmt.Printf("Failed to write file %s: %v\n", fileName, err)
+		fmt.Printf("Failed to write to file %s: %v\n", fileName, err)
 		return
 	}
 
 	fmt.Printf("Downloaded %s version %s\n", plugin.Slug, plugin.Version)
-	time.Sleep(1 * time.Second)
 }
 
 func main() {
-	pageNumber := 1
 	var wg sync.WaitGroup
-	jobs := make(chan Plugin, maxWorkers)
+	jobs := make(chan Plugin, maxWorkers*2) // give some buffer to the channel
+
+	var rateLimiter = time.Tick(rateLimit)
 
 	for i := 0; i < maxWorkers; i++ {
 		go func() {
@@ -87,27 +89,31 @@ func main() {
 		}()
 	}
 
-	for {
-		pluginList, err := fetchPluginList(pageNumber)
-		if err != nil {
-			fmt.Printf("Failed to fetch plugin list: %v\n", err)
-			time.Sleep(5 * time.Second)
-			continue
-		}
+	pageNumber := 1
 
-		if len(pluginList.Plugins) == 0 {
-			break
-		}
-
-		for _, plugin := range pluginList.Plugins {
-			if plugin.ActiveInstalls >= minInstalls {
-				wg.Add(1)
-				jobs <- plugin
+	go func() {
+		for {
+			pluginList, err := fetchPluginList(pageNumber)
+			if err != nil {
+				fmt.Printf("Failed to fetch plugin list for page %d: %v\n", pageNumber, err)
+				return
 			}
+
+			if len(pluginList.Plugins) == 0 {
+				break
+			}
+
+			for _, plugin := range pluginList.Plugins {
+				if plugin.ActiveInstalls >= minInstalls {
+					<-rateLimiter
+					wg.Add(1)
+					jobs <- plugin
+				}
+			}
+			pageNumber++
 		}
-		pageNumber++
-	}
+		close(jobs)
+	}()
 
 	wg.Wait()
-	close(jobs)
 }
